@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  session-server:
+    build: .
+    container_name: go-session-server
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./config.yaml:/config.yaml:ro
+      - ./certs:/certs          # Mount real TLS certs here in production
+    environment:
+      - SESSION_SERVER_PASSWORD=change-me-strong-password
+      - SESSION_TLS_ENABLED=false
+      # Override default TTL without touching config.yaml:
+      # - SESSION_SERVER_DEFAULT_TTL=15m
+    restart: unless-stopped
+    mem_limit: 64m              # Tight RAM budget — adjust per load
+    cpus: "0.5"
+
+  # Optional: Spring Boot app that connects to the session server
+  # spring-app:
+  #   image: your-spring-app:latest
+  #   depends_on:
+  #     - session-server
+  #   environment:
+  #     - SPRING_DATA_REDIS_HOST=session-server
+  #     - SPRING_DATA_REDIS_PORT=6379
+  #     - SPRING_DATA_REDIS_PASSWORD=change-me-strong-password
