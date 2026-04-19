@@ -164,6 +164,9 @@ func (s *Server) dispatch(c *connState, cmd *resp.Command) {
 	case "AUTH":
 		s.cmdAuth(c, cmd)
 		return
+	case "HELLO":
+		s.cmdHello(c, cmd)
+		return
 	case "QUIT":
 		c.writer.WriteOK()
 		c.conn.Close()
@@ -201,6 +204,8 @@ func (s *Server) dispatch(c *connState, cmd *resp.Command) {
 		s.cmdExpireAt(c, cmd)
 	case "PEXPIRE":
 		s.cmdPExpire(c, cmd)
+	case "PEXPIREAT":
+		s.cmdPExpireAt(c, cmd)
 	case "TTL":
 		s.cmdTTL(c, cmd)
 	case "PTTL":
@@ -230,6 +235,36 @@ func (s *Server) dispatch(c *connState, cmd *resp.Command) {
 		c.writer.WriteSimpleString("RESET")
 	case "CLIENT":
 		s.cmdClient(c, cmd)
+	case "HMSET":
+		s.cmdHMSet(c, cmd)
+	case "HSET":
+		s.cmdHSet(c, cmd)
+	case "HGET":
+		s.cmdHGet(c, cmd)
+	case "HGETALL":
+		s.cmdHGetAll(c, cmd)
+	case "HDEL":
+		s.cmdHDel(c, cmd)
+	case "HEXISTS":
+		s.cmdHExists(c, cmd)
+	case "HLEN":
+		s.cmdHLen(c, cmd)
+	case "RENAME":
+		s.cmdRename(c, cmd)
+	case "TYPE":
+		s.cmdType(c, cmd)
+	case "KEYS":
+		s.cmdKeys(c, cmd)
+	case "RANDOMKEY":
+		s.cmdRandomKey(c, cmd)
+	case "UNLINK":
+		s.cmdDel(c, cmd) // UNLINK is same as DEL for our purposes
+	case "MGET":
+		s.cmdMGet(c, cmd)
+	case "MSET":
+		s.cmdMSet(c, cmd)
+	case "SCAN":
+		s.cmdScan(c, cmd)
 	default:
 		c.writer.WriteError(fmt.Sprintf("ERR unknown command '%s'", cmd.Name))
 	}
@@ -250,6 +285,41 @@ func (s *Server) cmdAuth(c *connState, cmd *resp.Command) {
 		log.Printf("[security] Failed AUTH attempt from %s", c.conn.RemoteAddr())
 		c.writer.WriteError("WRONGPASS invalid username-password pair")
 	}
+}
+
+// ─── HELLO ────────────────────────────────────────────────────────────────────
+
+func (s *Server) cmdHello(c *connState, cmd *resp.Command) {
+	version := 2
+	if len(cmd.Args) >= 1 {
+		if v, err := strconv.Atoi(string(cmd.Args[0])); err == nil && (v == 2 || v == 3) {
+			version = v
+		}
+	}
+
+	// Handle inline AUTH: HELLO <ver> AUTH <user> <pass>
+	for i := 1; i < len(cmd.Args)-1; i++ {
+		if strings.ToUpper(string(cmd.Args[i])) == "AUTH" {
+			if i+2 < len(cmd.Args) {
+				password := string(cmd.Args[i+2])
+				if s.auth.CheckPassword(password) {
+					c.authenticated = true
+				} else {
+					log.Printf("[security] Failed AUTH attempt from %s", c.conn.RemoteAddr())
+					c.writer.WriteError("WRONGPASS invalid username-password pair")
+					return
+				}
+			}
+			break
+		}
+	}
+
+	_ = version
+	c.writer.WriteArray([][]byte{
+		[]byte("server"), []byte("go-session-server"),
+		[]byte("version"), []byte("1.0.0"),
+		[]byte("proto"), []byte("2"),
+	})
 }
 
 // ─── SET key value [EX seconds] [PX ms] [NX] [XX] ────────────────────────────
@@ -409,6 +479,23 @@ func (s *Server) cmdPExpire(c *connState, cmd *resp.Command) {
 	}
 }
 
+func (s *Server) cmdPExpireAt(c *connState, cmd *resp.Command) {
+	if len(cmd.Args) < 2 {
+		c.writer.WriteError("wrong number of arguments for 'PEXPIREAT'")
+		return
+	}
+	unixMs, err := strconv.ParseInt(string(cmd.Args[1]), 10, 64)
+	if err != nil {
+		c.writer.WriteError("value is not an integer")
+		return
+	}
+	if s.store.PExpireAt(string(cmd.Args[0]), unixMs) {
+		c.writer.WriteInteger(1)
+	} else {
+		c.writer.WriteInteger(0)
+	}
+}
+
 func (s *Server) cmdTTL(c *connState, cmd *resp.Command) {
 	if len(cmd.Args) < 1 {
 		c.writer.WriteError("wrong number of arguments for 'TTL'")
@@ -547,6 +634,252 @@ func (s *Server) cmdClient(c *connState, cmd *resp.Command) {
 	default:
 		c.writer.WriteOK()
 	}
+}
+
+// ─── HMSET key field value [field value ...] ──────────────────────────────────
+
+func (s *Server) cmdHMSet(c *connState, cmd *resp.Command) {
+	if len(cmd.Args) < 3 || len(cmd.Args)%2 == 0 {
+		c.writer.WriteError("wrong number of arguments for 'HMSET'")
+		return
+	}
+	key := string(cmd.Args[0])
+	fields := make(map[string][]byte)
+	for i := 1; i < len(cmd.Args); i += 2 {
+		fields[string(cmd.Args[i])] = cmd.Args[i+1]
+	}
+	if s.store.HMSet(key, fields, 0) {
+		c.writer.WriteOK()
+	} else {
+		c.writer.WriteError("ERR store is full (max_keys reached)")
+	}
+}
+
+// ─── HSET key field value [field value ...] ───────────────────────────────────
+
+func (s *Server) cmdHSet(c *connState, cmd *resp.Command) {
+	if len(cmd.Args) < 3 || len(cmd.Args)%2 == 0 {
+		c.writer.WriteError("wrong number of arguments for 'HSET'")
+		return
+	}
+	key := string(cmd.Args[0])
+	fields := make(map[string][]byte)
+	for i := 1; i < len(cmd.Args); i += 2 {
+		fields[string(cmd.Args[i])] = cmd.Args[i+1]
+	}
+	if s.store.HMSet(key, fields, 0) {
+		c.writer.WriteInteger(1)
+	} else {
+		c.writer.WriteError("ERR store is full (max_keys reached)")
+	}
+}
+
+// ─── HGET key field ───────────────────────────────────────────────────────────
+
+func (s *Server) cmdHGet(c *connState, cmd *resp.Command) {
+	if len(cmd.Args) < 2 {
+		c.writer.WriteError("wrong number of arguments for 'HGET'")
+		return
+	}
+	c.writer.WriteBulkString(s.store.HGet(string(cmd.Args[0]), string(cmd.Args[1])))
+}
+
+// ─── HGETALL key ──────────────────────────────────────────────────────────────
+
+func (s *Server) cmdHGetAll(c *connState, cmd *resp.Command) {
+	if len(cmd.Args) < 1 {
+		c.writer.WriteError("wrong number of arguments for 'HGETALL'")
+		return
+	}
+	fields := s.store.HGetAll(string(cmd.Args[0]))
+	if fields == nil {
+		c.writer.WriteArray([][]byte{})
+		return
+	}
+	result := make([][]byte, 0, len(fields)*2)
+	for k, v := range fields {
+		result = append(result, []byte(k), v)
+	}
+	c.writer.WriteArray(result)
+}
+
+// ─── HDEL key field [field ...] ───────────────────────────────────────────────
+
+func (s *Server) cmdHDel(c *connState, cmd *resp.Command) {
+	if len(cmd.Args) < 2 {
+		c.writer.WriteError("wrong number of arguments for 'HDEL'")
+		return
+	}
+	key := string(cmd.Args[0])
+	fields := make([]string, len(cmd.Args)-1)
+	for i, f := range cmd.Args[1:] {
+		fields[i] = string(f)
+	}
+	c.writer.WriteInteger(int64(s.store.HDel(key, fields...)))
+}
+
+// ─── HEXISTS key field ────────────────────────────────────────────────────────
+
+func (s *Server) cmdHExists(c *connState, cmd *resp.Command) {
+	if len(cmd.Args) < 2 {
+		c.writer.WriteError("wrong number of arguments for 'HEXISTS'")
+		return
+	}
+	if s.store.HExists(string(cmd.Args[0]), string(cmd.Args[1])) {
+		c.writer.WriteInteger(1)
+	} else {
+		c.writer.WriteInteger(0)
+	}
+}
+
+// ─── HLEN key ─────────────────────────────────────────────────────────────────
+
+func (s *Server) cmdHLen(c *connState, cmd *resp.Command) {
+	if len(cmd.Args) < 1 {
+		c.writer.WriteError("wrong number of arguments for 'HLEN'")
+		return
+	}
+	c.writer.WriteInteger(int64(s.store.HLen(string(cmd.Args[0]))))
+}
+
+// ─── RENAME oldkey newkey ────────────────────────────────────────────────────
+
+func (s *Server) cmdRename(c *connState, cmd *resp.Command) {
+	if len(cmd.Args) < 2 {
+		c.writer.WriteError("wrong number of arguments for 'RENAME'")
+		return
+	}
+	if s.store.Rename(string(cmd.Args[0]), string(cmd.Args[1])) {
+		c.writer.WriteOK()
+	} else {
+		c.writer.WriteError("ERR no such key")
+	}
+}
+
+// ─── TYPE key ──────────────────────────────────────────────────────────────────
+
+func (s *Server) cmdType(c *connState, cmd *resp.Command) {
+	if len(cmd.Args) < 1 {
+		c.writer.WriteError("wrong number of arguments for 'TYPE'")
+		return
+	}
+	c.writer.WriteSimpleString(s.store.Type(string(cmd.Args[0])))
+}
+
+// ─── KEYS pattern ──────────────────────────────────────────────────────────────
+
+func (s *Server) cmdKeys(c *connState, cmd *resp.Command) {
+	if len(cmd.Args) < 1 {
+		c.writer.WriteError("wrong number of arguments for 'KEYS'")
+		return
+	}
+	pattern := string(cmd.Args[0])
+	allKeys := s.store.AllKeys()
+	var keys [][]byte
+
+	for _, k := range allKeys {
+		if matchPattern(k, pattern) {
+			keys = append(keys, []byte(k))
+		}
+	}
+
+	c.writer.WriteArray(keys)
+}
+
+func matchPattern(key, pattern string) bool {
+	if pattern == "*" {
+		return true
+	}
+	// Simple glob: * and ?
+	pi, ki := 0, 0
+	for pi < len(pattern) && ki < len(key) {
+		if pattern[pi] == '*' {
+			if pi == len(pattern)-1 {
+				return true
+			}
+			// Find next char in pattern
+			for ki < len(key) {
+				if matchPattern(key[ki:], pattern[pi+1:]) {
+					return true
+				}
+				ki++
+			}
+			return false
+		}
+		if pattern[pi] == '?' || pattern[pi] == key[ki] {
+			pi++
+			ki++
+		} else {
+			return false
+		}
+	}
+	return pi == len(pattern) && ki == len(key)
+}
+
+// ─── RANDOMKEY ────────────────────────────────────────────────────────────────
+
+func (s *Server) cmdRandomKey(c *connState, cmd *resp.Command) {
+	allKeys := s.store.AllKeys()
+	if len(allKeys) > 0 {
+		c.writer.WriteBulkString([]byte(allKeys[0]))
+	} else {
+		c.writer.WriteNull()
+	}
+}
+
+// ─── MGET key [key ...] ────────────────────────────────────────────────────────
+
+func (s *Server) cmdMGet(c *connState, cmd *resp.Command) {
+	if len(cmd.Args) < 1 {
+		c.writer.WriteError("wrong number of arguments for 'MGET'")
+		return
+	}
+	result := make([][]byte, len(cmd.Args))
+	for i, k := range cmd.Args {
+		val := s.store.Get(string(k))
+		if val == nil {
+			result[i] = nil
+		} else {
+			result[i] = val
+		}
+	}
+	c.writer.WriteArray(result)
+}
+
+// ─── MSET key value [key value ...] ────────────────────────────────────────────
+
+func (s *Server) cmdMSet(c *connState, cmd *resp.Command) {
+	if len(cmd.Args) < 2 || len(cmd.Args)%2 != 0 {
+		c.writer.WriteError("wrong number of arguments for 'MSET'")
+		return
+	}
+	for i := 0; i < len(cmd.Args); i += 2 {
+		s.store.Set(string(cmd.Args[i]), cmd.Args[i+1], 0)
+	}
+	c.writer.WriteOK()
+}
+
+// ─── SCAN cursor [MATCH pattern] [COUNT count] ─────────────────────────────────
+
+func (s *Server) cmdScan(c *connState, cmd *resp.Command) {
+	if len(cmd.Args) < 1 {
+		c.writer.WriteError("wrong number of arguments for 'SCAN'")
+		return
+	}
+	// Simplified SCAN: return cursor=0 and keys
+	allKeys := s.store.AllKeys()
+	var keys [][]byte
+	for _, k := range allKeys {
+		if len(keys) >= 100 {
+			break
+		}
+		keys = append(keys, []byte(k))
+	}
+	// Return [cursor, keys]
+	result := make([][]byte, len(keys)+1)
+	result[0] = []byte("0") // cursor = 0 (scan complete)
+	copy(result[1:], keys)
+	c.writer.WriteArray(result)
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────

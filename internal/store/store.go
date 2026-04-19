@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 // entry holds a session value and its expiry
@@ -17,10 +18,21 @@ func (e *entry) expired() bool {
 	return !e.expiresAt.IsZero() && time.Now().After(e.expiresAt)
 }
 
+// hashEntry holds a hash field value and its expiry
+type hashEntry struct {
+	fields    map[string][]byte
+	expiresAt time.Time // zero = no expiry
+}
+
+func (h *hashEntry) expired() bool {
+	return !h.expiresAt.IsZero() && time.Now().After(h.expiresAt)
+}
+
 // shard is one partition of the store, independently locked
 type shard struct {
-	mu   sync.RWMutex
-	data map[string]*entry
+	mu     sync.RWMutex
+	data   map[string]*entry
+	hashes map[string]*hashEntry
 }
 
 // Store is a sharded, concurrent, TTL-aware in-memory key-value store
@@ -48,7 +60,10 @@ func New(shardCount int, defaultTTL, maxTTL, sweepInterval time.Duration, maxKey
 	}
 	shards := make([]*shard, shardCount)
 	for i := range shards {
-		shards[i] = &shard{data: make(map[string]*entry)}
+		shards[i] = &shard{
+			data:   make(map[string]*entry),
+			hashes: make(map[string]*hashEntry),
+		}
 	}
 
 	s := &Store{
@@ -165,6 +180,12 @@ func (s *Store) Delete(keys ...string) int {
 			deleted++
 			s.dels.Add(1)
 		}
+		if _, ok := sh.hashes[key]; ok {
+			delete(sh.hashes, key)
+			s.totalKeys.Add(-1)
+			deleted++
+			s.dels.Add(1)
+		}
 		sh.mu.Unlock()
 	}
 	return deleted
@@ -176,9 +197,10 @@ func (s *Store) Exists(keys ...string) int {
 	for _, key := range keys {
 		sh := s.getShard(key)
 		sh.mu.RLock()
-		e, ok := sh.data[key]
+		e, eok := sh.data[key]
+		h, hok := sh.hashes[key]
 		sh.mu.RUnlock()
-		if ok && !e.expired() {
+		if (eok && !e.expired()) || (hok && !h.expired()) {
 			count++
 		}
 	}
@@ -190,16 +212,56 @@ func (s *Store) Expire(key string, ttl time.Duration) bool {
 	if s.maxTTL > 0 && ttl > s.maxTTL {
 		ttl = s.maxTTL
 	}
+	t := time.Now().Add(ttl)
 	sh := s.getShard(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
-	e, ok := sh.data[key]
-	if !ok || e.expired() {
-		return false
+	if e, ok := sh.data[key]; ok && !e.expired() {
+		e.expiresAt = t
+		return true
 	}
-	e.expiresAt = time.Now().Add(ttl)
-	return true
+	if h, ok := sh.hashes[key]; ok && !h.expired() {
+		h.expiresAt = t
+		return true
+	}
+	return false
+}
+
+// ExpireAt sets expiry to an absolute Unix timestamp (seconds)
+func (s *Store) ExpireAt(key string, unixSec int64) bool {
+	t := time.Unix(unixSec, 0)
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	if e, ok := sh.data[key]; ok && !e.expired() {
+		e.expiresAt = t
+		return true
+	}
+	if h, ok := sh.hashes[key]; ok && !h.expired() {
+		h.expiresAt = t
+		return true
+	}
+	return false
+}
+
+// PExpireAt sets expiry to an absolute Unix timestamp (milliseconds) — works on strings and hashes
+func (s *Store) PExpireAt(key string, unixMs int64) bool {
+	t := time.UnixMilli(unixMs)
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	if e, ok := sh.data[key]; ok && !e.expired() {
+		e.expiresAt = t
+		return true
+	}
+	if h, ok := sh.hashes[key]; ok && !h.expired() {
+		h.expiresAt = t
+		return true
+	}
+	return false
 }
 
 // TTL returns remaining time for a key. -1 = no expiry, -2 = not found/expired.
@@ -227,6 +289,7 @@ func (s *Store) FlushAll() {
 	for _, sh := range s.shards {
 		sh.mu.Lock()
 		sh.data = make(map[string]*entry)
+		sh.hashes = make(map[string]*hashEntry)
 		sh.mu.Unlock()
 	}
 	s.totalKeys.Store(0)
@@ -265,8 +328,214 @@ func (s *Store) sweep() {
 				s.totalKeys.Add(-1)
 			}
 		}
+		for k, h := range sh.hashes {
+			if h.expired() {
+				delete(sh.hashes, k)
+				s.totalKeys.Add(-1)
+			}
+		}
 		sh.mu.Unlock()
 	}
+}
+
+// ─── Hash Commands ────────────────────────────────────────────────────────────
+
+// HMSet merges multiple hash fields into an existing hash (or creates it).
+func (s *Store) HMSet(key string, fields map[string][]byte, ttl time.Duration) bool {
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	h, existed := sh.hashes[key]
+	if !existed {
+		if s.maxKeys > 0 && s.totalKeys.Load() >= int64(s.maxKeys) {
+			return false
+		}
+		h = &hashEntry{fields: make(map[string][]byte)}
+		sh.hashes[key] = h
+		s.totalKeys.Add(1)
+	}
+
+	// Merge: update only provided fields, preserve existing ones
+	for k, v := range fields {
+		h.fields[k] = v
+	}
+
+	// Only set TTL when creating a new key; HMSET on an existing key preserves TTL
+	if !existed && ttl != 0 {
+		if s.maxTTL > 0 && ttl > s.maxTTL {
+			ttl = s.maxTTL
+		}
+		h.expiresAt = time.Now().Add(ttl)
+	}
+	return true
+}
+
+// HGetAll retrieves all fields of a hash
+func (s *Store) HGetAll(key string) map[string][]byte {
+	sh := s.getShard(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+
+	h, ok := sh.hashes[key]
+	if !ok || h.expired() {
+		if ok && h.expired() {
+			sh.mu.RUnlock()
+			sh.mu.Lock()
+			delete(sh.hashes, key)
+			s.totalKeys.Add(-1)
+			sh.mu.Unlock()
+			sh.mu.RLock()
+		}
+		return nil
+	}
+
+	// Return a copy to avoid external mutation
+	result := make(map[string][]byte, len(h.fields))
+	for k, v := range h.fields {
+		result[k] = v
+	}
+	return result
+}
+
+// HGet retrieves a single hash field
+func (s *Store) HGet(key, field string) []byte {
+	sh := s.getShard(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+
+	h, ok := sh.hashes[key]
+	if !ok || h.expired() {
+		return nil
+	}
+	return h.fields[field]
+}
+
+// HDel deletes hash fields
+func (s *Store) HDel(key string, fields ...string) int {
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	h, ok := sh.hashes[key]
+	if !ok || h.expired() {
+		return 0
+	}
+
+	count := 0
+	for _, f := range fields {
+		if _, exists := h.fields[f]; exists {
+			delete(h.fields, f)
+			count++
+		}
+	}
+
+	// If hash is now empty, remove the key
+	if len(h.fields) == 0 {
+		delete(sh.hashes, key)
+		s.totalKeys.Add(-1)
+	}
+
+	return count
+}
+
+// HLen returns number of fields in a hash
+func (s *Store) HLen(key string) int {
+	sh := s.getShard(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+
+	h, ok := sh.hashes[key]
+	if !ok || h.expired() {
+		return 0
+	}
+	return len(h.fields)
+}
+
+// HExists checks if a field exists in a hash
+func (s *Store) HExists(key, field string) bool {
+	sh := s.getShard(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+
+	h, ok := sh.hashes[key]
+	if !ok || h.expired() {
+		return false
+	}
+	_, exists := h.fields[field]
+	return exists
+}
+
+// Type returns the type of a key: "string", "hash", or "none"
+func (s *Store) Type(key string) string {
+	sh := s.getShard(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+
+	if e, ok := sh.data[key]; ok && !e.expired() {
+		return "string"
+	}
+	if h, ok := sh.hashes[key]; ok && !h.expired() {
+		return "hash"
+	}
+	return "none"
+}
+
+// AllKeys returns all non-expired keys (both strings and hashes)
+func (s *Store) AllKeys() []string {
+	var keys []string
+	for _, sh := range s.shards {
+		sh.mu.RLock()
+		for k, e := range sh.data {
+			if !e.expired() {
+				keys = append(keys, k)
+			}
+		}
+		for k, h := range sh.hashes {
+			if !h.expired() {
+				keys = append(keys, k)
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	return keys
+}
+
+// Rename renames a key. Returns true if successful, false if old key doesn't exist.
+func (s *Store) Rename(oldKey, newKey string) bool {
+	if oldKey == newKey {
+		return s.Exists(oldKey) == 1
+	}
+
+	oldSh := s.getShard(oldKey)
+	newSh := s.getShard(newKey)
+
+	// Lock order: lowest address first to avoid deadlock
+	if uintptr(unsafe.Pointer(oldSh)) < uintptr(unsafe.Pointer(newSh)) {
+		oldSh.mu.Lock()
+		newSh.mu.Lock()
+	} else {
+		newSh.mu.Lock()
+		oldSh.mu.Lock()
+	}
+	defer oldSh.mu.Unlock()
+	defer newSh.mu.Unlock()
+
+	// Move string entry
+	if e, ok := oldSh.data[oldKey]; ok && !e.expired() {
+		newSh.data[newKey] = e
+		delete(oldSh.data, oldKey)
+		return true
+	}
+
+	// Move hash entry
+	if h, ok := oldSh.hashes[oldKey]; ok && !h.expired() {
+		newSh.hashes[newKey] = h
+		delete(oldSh.hashes, oldKey)
+		return true
+	}
+
+	return false
 }
 
 // Close stops the background sweeper
