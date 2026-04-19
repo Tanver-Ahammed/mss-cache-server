@@ -51,6 +51,9 @@ type Store struct {
 	misses atomic.Int64
 	sets   atomic.Int64
 	dels   atomic.Int64
+
+	// OnExpiry is called by the sweeper with expired keys for persistence cleanup
+	OnExpiry func(keys []string)
 }
 
 // New creates a new Store and starts the background TTL sweeper
@@ -320,21 +323,27 @@ func (s *Store) sweeper() {
 }
 
 func (s *Store) sweep() {
+	var expired []string
 	for _, sh := range s.shards {
 		sh.mu.Lock()
 		for k, e := range sh.data {
 			if e.expired() {
 				delete(sh.data, k)
 				s.totalKeys.Add(-1)
+				expired = append(expired, k)
 			}
 		}
 		for k, h := range sh.hashes {
 			if h.expired() {
 				delete(sh.hashes, k)
 				s.totalKeys.Add(-1)
+				expired = append(expired, k)
 			}
 		}
 		sh.mu.Unlock()
+	}
+	if len(expired) > 0 && s.OnExpiry != nil {
+		s.OnExpiry(expired)
 	}
 }
 
@@ -536,6 +545,46 @@ func (s *Store) Rename(oldKey, newKey string) bool {
 	}
 
 	return false
+}
+
+// SetAbs stores key=value with an absolute expiry time (used for DB reload).
+// expiresAt.IsZero() means no expiry.
+func (s *Store) SetAbs(key string, value []byte, expiresAt time.Time) bool {
+	if s.maxKeys > 0 && s.totalKeys.Load() >= int64(s.maxKeys) {
+		return false
+	}
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	_, existed := sh.data[key]
+	sh.data[key] = &entry{value: value, expiresAt: expiresAt}
+	sh.mu.Unlock()
+
+	if !existed {
+		s.totalKeys.Add(1)
+	}
+	s.sets.Add(1)
+	return true
+}
+
+// HMSetAbs stores a hash with an absolute expiry time (used for DB reload).
+func (s *Store) HMSetAbs(key string, fields map[string][]byte, expiresAt time.Time) bool {
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	h, existed := sh.hashes[key]
+	if !existed {
+		if s.maxKeys > 0 && s.totalKeys.Load() >= int64(s.maxKeys) {
+			return false
+		}
+		h = &hashEntry{fields: make(map[string][]byte)}
+		sh.hashes[key] = h
+		s.totalKeys.Add(1)
+	}
+	for k, v := range fields {
+		h.fields[k] = v
+	}
+	h.expiresAt = expiresAt
+	return true
 }
 
 // Close stops the background sweeper

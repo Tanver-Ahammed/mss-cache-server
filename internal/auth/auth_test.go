@@ -52,11 +52,16 @@ func TestEmptyAllowlistPermitsAll(t *testing.T) {
 	}
 }
 
-func TestLoopbackAlwaysAllowed(t *testing.T) {
-	// Even with a strict allowlist, loopback should pass
+func TestLoopbackNotImplicitlyAllowed(t *testing.T) {
+	// With a non-empty allowlist that excludes loopback, 127.0.0.1 is denied.
 	m := auth.New("pass", true, []string{"10.0.0.1"})
-	if !m.IsIPAllowed("127.0.0.1:5678") {
-		t.Error("loopback should always be allowed")
+	if m.IsIPAllowed("127.0.0.1:5678") {
+		t.Error("loopback must NOT bypass a non-empty allowlist")
+	}
+	// When explicitly listed, loopback is allowed.
+	m2 := auth.New("pass", true, []string{"127.0.0.1"})
+	if !m2.IsIPAllowed("127.0.0.1:5678") {
+		t.Error("loopback should be allowed when explicitly listed")
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"log"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/yourorg/go-session-server/internal/auth"
 	"github.com/yourorg/go-session-server/internal/config"
+	"github.com/yourorg/go-session-server/internal/db"
 	"github.com/yourorg/go-session-server/internal/resp"
 	"github.com/yourorg/go-session-server/internal/store"
 	tlsutil "github.com/yourorg/go-session-server/internal/tls"
@@ -27,26 +29,63 @@ type Server struct {
 	cfg         *config.Config
 	store       *store.Store
 	auth        *auth.Manager
+	db          *db.DB
 	listener    net.Listener
 	activeConns atomic.Int64
 	mu          sync.Mutex
 }
 
-func NewServer(cfg *config.Config) *Server {
-	return &Server{
-		cfg: cfg,
-		store: store.New(
-			cfg.Server.ShardCount,
-			cfg.Session.DefaultTTL,
-			cfg.Session.MaxTTL,
-			cfg.Session.SweepInterval,
-			cfg.Session.MaxKeys,
-		),
-		auth: auth.New(cfg.Auth.Password, cfg.Auth.RequireAuth, cfg.Auth.AllowedIPs),
+func NewServer(cfg *config.Config) (*Server, error) {
+	st := store.New(
+		cfg.Server.ShardCount,
+		cfg.Session.DefaultTTL,
+		cfg.Session.MaxTTL,
+		cfg.Session.SweepInterval,
+		cfg.Session.MaxKeys,
+	)
+
+	srv := &Server{
+		cfg:   cfg,
+		store: st,
+		auth:  auth.New(cfg.Auth.Password, cfg.Auth.RequireAuth, cfg.Auth.AllowedIPs),
 	}
+
+	if cfg.Database.Enabled {
+		log.Printf("[db] Connecting to postgres://%s:****@%s:%d/%s",
+			cfg.Database.User, cfg.Database.Host, cfg.Database.Port, cfg.Database.Name)
+		d, err := db.New(cfg.Database.DSNString(), cfg.Database.QueueDepth)
+		if err != nil {
+			return nil, fmt.Errorf("database: %w", err)
+		}
+		srv.db = d
+
+		st.OnExpiry = func(keys []string) {
+			d.AsyncDeleteKeys(keys...)
+		}
+	}
+
+	return srv, nil
 }
 
 func (s *Server) Start() error {
+	// ── Load from DB ───────────────────────────────────────────────
+	if s.db != nil {
+		log.Printf("[db] Loading sessions from PostgreSQL...")
+		start := time.Now()
+		err := s.db.LoadAll(
+			func(key string, value []byte, expiresAt time.Time) {
+				s.store.SetAbs(key, value, expiresAt)
+			},
+			func(key string, fields map[string][]byte, expiresAt time.Time) {
+				s.store.HMSetAbs(key, fields, expiresAt)
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("loading sessions from DB: %w", err)
+		}
+		log.Printf("[db] Loaded %d keys in %s", s.store.Len(), time.Since(start))
+	}
+
 	addr := fmt.Sprintf("%s:%d", s.cfg.Server.Host, s.cfg.Server.Port)
 
 	var (
@@ -114,6 +153,26 @@ func (s *Server) Stop() {
 		s.listener.Close()
 	}
 	s.store.Close()
+	if s.db != nil {
+		log.Printf("[db] Flushing write-behind queue...")
+		s.db.Close()
+		log.Printf("[db] Database connection closed")
+	}
+}
+
+// resolveExpiry mirrors the TTL→expiresAt logic inside store.Set so that
+// command handlers can pass the correct expiresAt to the DB layer.
+func (s *Server) resolveExpiry(ttl time.Duration) time.Time {
+	if ttl == 0 {
+		ttl = s.cfg.Session.DefaultTTL
+	}
+	if s.cfg.Session.MaxTTL > 0 && ttl > s.cfg.Session.MaxTTL {
+		ttl = s.cfg.Session.MaxTTL
+	}
+	if ttl > 0 {
+		return time.Now().Add(ttl)
+	}
+	return time.Time{}
 }
 
 // ─── Connection Handler ───────────────────────────────────────────────────────
@@ -220,6 +279,13 @@ func (s *Server) dispatch(c *connState, cmd *resp.Command) {
 		s.cmdGetDel(c, cmd)
 	case "FLUSHALL", "FLUSHDB":
 		s.store.FlushAll()
+		if s.db != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := s.db.FlushAll(ctx); err != nil {
+				log.Printf("[db] WARNING: FlushAll failed: %v", err)
+			}
+			cancel()
+		}
 		c.writer.WriteOK()
 	case "DBSIZE":
 		c.writer.WriteInteger(s.store.Len())
@@ -373,6 +439,9 @@ func (s *Server) cmdSet(c *connState, cmd *resp.Command) {
 
 	if nx {
 		if s.store.SetNX(key, value, ttl) {
+			if s.db != nil {
+				s.db.AsyncSetSession(key, value, s.resolveExpiry(ttl))
+			}
 			c.writer.WriteOK()
 		} else {
 			c.writer.WriteNull()
@@ -386,6 +455,9 @@ func (s *Server) cmdSet(c *connState, cmd *resp.Command) {
 	if !s.store.Set(key, value, ttl) {
 		c.writer.WriteError("ERR store is full (max_keys reached)")
 		return
+	}
+	if s.db != nil {
+		s.db.AsyncSetSession(key, value, s.resolveExpiry(ttl))
 	}
 	c.writer.WriteOK()
 }
@@ -407,7 +479,11 @@ func (s *Server) cmdDel(c *connState, cmd *resp.Command) {
 	for i, a := range cmd.Args {
 		keys[i] = string(a)
 	}
-	c.writer.WriteInteger(int64(s.store.Delete(keys...)))
+	n := s.store.Delete(keys...)
+	if s.db != nil && n > 0 {
+		s.db.AsyncDeleteKeys(keys...)
+	}
+	c.writer.WriteInteger(int64(n))
 }
 
 func (s *Server) cmdExists(c *connState, cmd *resp.Command) {
@@ -534,6 +610,9 @@ func (s *Server) cmdSetNX(c *connState, cmd *resp.Command) {
 		return
 	}
 	if s.store.SetNX(string(cmd.Args[0]), cmd.Args[1], 0) {
+		if s.db != nil {
+			s.db.AsyncSetSession(string(cmd.Args[0]), cmd.Args[1], s.resolveExpiry(0))
+		}
 		c.writer.WriteInteger(1)
 	} else {
 		c.writer.WriteInteger(0)
@@ -550,7 +629,11 @@ func (s *Server) cmdSetEX(c *connState, cmd *resp.Command) {
 		c.writer.WriteError("invalid expire time in 'SETEX'")
 		return
 	}
-	s.store.Set(string(cmd.Args[0]), cmd.Args[2], time.Duration(secs)*time.Second)
+	ttl := time.Duration(secs) * time.Second
+	s.store.Set(string(cmd.Args[0]), cmd.Args[2], ttl)
+	if s.db != nil {
+		s.db.AsyncSetSession(string(cmd.Args[0]), cmd.Args[2], s.resolveExpiry(ttl))
+	}
 	c.writer.WriteOK()
 }
 
@@ -561,6 +644,9 @@ func (s *Server) cmdGetSet(c *connState, cmd *resp.Command) {
 	}
 	old := s.store.Get(string(cmd.Args[0]))
 	s.store.Set(string(cmd.Args[0]), cmd.Args[1], 0)
+	if s.db != nil {
+		s.db.AsyncSetSession(string(cmd.Args[0]), cmd.Args[1], s.resolveExpiry(0))
+	}
 	c.writer.WriteBulkString(old)
 }
 
@@ -569,9 +655,13 @@ func (s *Server) cmdGetDel(c *connState, cmd *resp.Command) {
 		c.writer.WriteError("wrong number of arguments for 'GETDEL'")
 		return
 	}
-	val := s.store.Get(string(cmd.Args[0]))
+	key := string(cmd.Args[0])
+	val := s.store.Get(key)
 	if val != nil {
-		s.store.Delete(string(cmd.Args[0]))
+		s.store.Delete(key)
+		if s.db != nil {
+			s.db.AsyncDeleteKeys(key)
+		}
 	}
 	c.writer.WriteBulkString(val)
 }
@@ -649,6 +739,9 @@ func (s *Server) cmdHMSet(c *connState, cmd *resp.Command) {
 		fields[string(cmd.Args[i])] = cmd.Args[i+1]
 	}
 	if s.store.HMSet(key, fields, 0) {
+		if s.db != nil {
+			s.db.AsyncSetHash(key, fields, time.Time{})
+		}
 		c.writer.WriteOK()
 	} else {
 		c.writer.WriteError("ERR store is full (max_keys reached)")
@@ -668,6 +761,9 @@ func (s *Server) cmdHSet(c *connState, cmd *resp.Command) {
 		fields[string(cmd.Args[i])] = cmd.Args[i+1]
 	}
 	if s.store.HMSet(key, fields, 0) {
+		if s.db != nil {
+			s.db.AsyncSetHash(key, fields, time.Time{})
+		}
 		c.writer.WriteInteger(1)
 	} else {
 		c.writer.WriteError("ERR store is full (max_keys reached)")
@@ -854,7 +950,11 @@ func (s *Server) cmdMSet(c *connState, cmd *resp.Command) {
 		return
 	}
 	for i := 0; i < len(cmd.Args); i += 2 {
-		s.store.Set(string(cmd.Args[i]), cmd.Args[i+1], 0)
+		k, v := string(cmd.Args[i]), cmd.Args[i+1]
+		s.store.Set(k, v, 0)
+		if s.db != nil {
+			s.db.AsyncSetSession(k, v, s.resolveExpiry(0))
+		}
 	}
 	c.writer.WriteOK()
 }
@@ -895,7 +995,10 @@ func main() {
 		log.Fatalf("[startup] Failed to load config: %v", err)
 	}
 
-	srv := NewServer(cfg)
+	srv, err := NewServer(cfg)
+	if err != nil {
+		log.Fatalf("[startup] %v", err)
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

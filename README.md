@@ -94,7 +94,7 @@ AUTH_ALLOWED_IPS=
 ```
 
 Rules:
-- `127.0.0.1` / `::1` (loopback) is **always** allowed regardless of allowlist
+- Only listed entries can connect; loopback has **no** implicit exception — add `127.0.0.1` / `::1` explicitly if localhost should access the server
 - Invalid entries are skipped with a warning at startup
 - Connection is dropped before AUTH if the IP is not allowed
 
