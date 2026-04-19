@@ -36,9 +36,9 @@ services:
       - DB_ENABLED=true
       - DB_HOST=postgres
       - DB_PORT=5432
-      - DB_NAME=sessions
-      - DB_USER=postgres
-      - DB_PASSWORD=12345
+      - MSS_DB_NAME=sessions
+      - MSS_DB_USER=postgres
+      - MSS_DB_PASSWORD=12345
       - DB_SSLMODE=disable
       - DB_QUEUE_DEPTH=4096
       # Override defaults without touching config.conf:

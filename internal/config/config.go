@@ -227,11 +227,11 @@ func applyKey(cfg *Config, key, val string) {
 		if n, err := strconv.Atoi(val); err == nil {
 			cfg.Database.Port = n
 		}
-	case "DB_NAME":
+	case "MSS_DB_NAME":
 		cfg.Database.Name = val
-	case "DB_USER":
+	case "MSS_DB_USER":
 		cfg.Database.User = val
-	case "DB_PASSWORD":
+	case "MSS_DB_PASSWORD":
 		cfg.Database.Password = val
 	case "DB_SSLMODE":
 		cfg.Database.SSLMode = val
@@ -250,8 +250,8 @@ func applyEnv(cfg *Config) *Config {
 		"TLS_ENABLED", "TLS_CERT_FILE", "TLS_KEY_FILE",
 		"SESSION_DEFAULT_TTL", "SESSION_MAX_TTL", "SESSION_SWEEP_INTERVAL", "SESSION_MAX_KEYS",
 		"LOG_LEVEL", "LOG_FORMAT",
-		"DB_ENABLED", "DB_DSN", "DB_HOST", "DB_PORT", "DB_NAME",
-		"DB_USER", "DB_PASSWORD", "DB_SSLMODE", "DB_QUEUE_DEPTH",
+		"DB_ENABLED", "DB_DSN", "DB_HOST", "DB_PORT", "MSS_DB_NAME",
+		"MSS_DB_USER", "MSS_DB_PASSWORD", "DB_SSLMODE", "DB_QUEUE_DEPTH",
 	}
 	for _, k := range keys {
 		if v := os.Getenv(k); v != "" {
