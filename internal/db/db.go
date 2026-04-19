@@ -3,7 +3,6 @@ package db
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -67,6 +66,15 @@ func New(dsn string, queueDepth int) (*DB, error) {
 
 func applySchema(ctx context.Context, pool *sql.DB) error {
 	const ddl = `
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'session_hashes' AND column_name = 'fields'
+    ) THEN
+        DROP TABLE session_hashes CASCADE;
+    END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS sessions (
     key        TEXT        NOT NULL PRIMARY KEY,
     value      BYTEA       NOT NULL,
@@ -74,8 +82,13 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE TABLE IF NOT EXISTS session_hashes (
     key        TEXT        NOT NULL PRIMARY KEY,
-    fields     JSONB       NOT NULL DEFAULT '{}',
     expires_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS session_hash_fields (
+    key   TEXT  NOT NULL REFERENCES session_hashes(key) ON DELETE CASCADE,
+    field TEXT  NOT NULL,
+    value BYTEA NOT NULL,
+    PRIMARY KEY (key, field)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at
     ON sessions (expires_at) WHERE expires_at IS NOT NULL;
@@ -166,27 +179,43 @@ func (d *DB) execSetSession(ctx context.Context, op dbOp) error {
 }
 
 func (d *DB) execSetHash(ctx context.Context, op dbOp) error {
-	jsonFields := make(map[string]string, len(op.fields))
-	for k, v := range op.fields {
-		jsonFields[k] = string(v)
-	}
-	rawJSON, err := json.Marshal(jsonFields)
-	if err != nil {
-		return fmt.Errorf("marshal fields: %w", err)
-	}
-
 	var expiresAt interface{}
 	if !op.expiresAt.IsZero() {
 		expiresAt = op.expiresAt.UTC()
 	}
-	_, err = d.pool.ExecContext(ctx, `
-        INSERT INTO session_hashes (key, fields, expires_at)
-        VALUES ($1, $2::jsonb, $3)
+
+	tx, err := d.pool.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+        INSERT INTO session_hashes (key, expires_at)
+        VALUES ($1, $2)
         ON CONFLICT (key) DO UPDATE
-            SET fields     = session_hashes.fields || EXCLUDED.fields,
-                expires_at = COALESCE(session_hashes.expires_at, EXCLUDED.expires_at)
-    `, op.key, rawJSON, expiresAt)
-	return err
+            SET expires_at = COALESCE(session_hashes.expires_at, EXCLUDED.expires_at)
+    `, op.key, expiresAt); err != nil {
+		return fmt.Errorf("upsert session_hashes: %w", err)
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `
+        INSERT INTO session_hash_fields (key, field, value)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (key, field) DO UPDATE SET value = EXCLUDED.value
+    `)
+	if err != nil {
+		return fmt.Errorf("prepare field upsert: %w", err)
+	}
+	defer stmt.Close()
+
+	for field, value := range op.fields {
+		if _, err := stmt.ExecContext(ctx, op.key, field, value); err != nil {
+			return fmt.Errorf("upsert field %q: %w", field, err)
+		}
+	}
+
+	return tx.Commit()
 }
 
 func (d *DB) execDeleteKeys(ctx context.Context, keys []string) error {
@@ -239,39 +268,60 @@ func (d *DB) LoadAll(
 		return fmt.Errorf("iterate sessions: %w", err)
 	}
 
-	hrows, err := d.pool.QueryContext(ctx,
-		`SELECT key, fields, expires_at FROM session_hashes
-         WHERE expires_at IS NULL OR expires_at > NOW()`)
+	hrows, err := d.pool.QueryContext(ctx, `
+        SELECT h.key, h.expires_at, f.field, f.value
+        FROM session_hashes h
+        LEFT JOIN session_hash_fields f ON f.key = h.key
+        WHERE h.expires_at IS NULL OR h.expires_at > NOW()
+        ORDER BY h.key`)
 	if err != nil {
 		return fmt.Errorf("query session_hashes: %w", err)
 	}
 	defer hrows.Close()
+
+	var (
+		haveKey      bool
+		curKey       string
+		curFields    map[string][]byte
+		curExpiresAt time.Time
+	)
+	flush := func() {
+		if haveKey {
+			hashFn(curKey, curFields, curExpiresAt)
+		}
+	}
 	for hrows.Next() {
 		var key string
-		var rawJSON []byte
 		var expiresAt sql.NullTime
-		if err := hrows.Scan(&key, &rawJSON, &expiresAt); err != nil {
+		var field sql.NullString
+		var value []byte
+		if err := hrows.Scan(&key, &expiresAt, &field, &value); err != nil {
 			return fmt.Errorf("scan hash row: %w", err)
 		}
-		var jsonFields map[string]string
-		if err := json.Unmarshal(rawJSON, &jsonFields); err != nil {
-			return fmt.Errorf("unmarshal fields for key %q: %w", key, err)
+		if !haveKey || key != curKey {
+			flush()
+			haveKey = true
+			curKey = key
+			curFields = make(map[string][]byte)
+			if expiresAt.Valid {
+				curExpiresAt = expiresAt.Time
+			} else {
+				curExpiresAt = time.Time{}
+			}
 		}
-		fields := make(map[string][]byte, len(jsonFields))
-		for k, v := range jsonFields {
-			fields[k] = []byte(v)
+		if field.Valid {
+			curFields[field.String] = value
 		}
-		var t time.Time
-		if expiresAt.Valid {
-			t = expiresAt.Time
-		}
-		hashFn(key, fields, t)
 	}
-	return hrows.Err()
+	if err := hrows.Err(); err != nil {
+		return err
+	}
+	flush()
+	return nil
 }
 
 func (d *DB) FlushAll(ctx context.Context) error {
-	_, err := d.pool.ExecContext(ctx, `TRUNCATE sessions, session_hashes`)
+	_, err := d.pool.ExecContext(ctx, `TRUNCATE sessions, session_hash_fields, session_hashes`)
 	return err
 }
 

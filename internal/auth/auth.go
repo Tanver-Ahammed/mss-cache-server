@@ -67,7 +67,8 @@ func New(password string, requireAuth bool, allowedIPs []string) *Manager {
 }
 
 // IsIPAllowed returns true if the remote address is permitted.
-// If the allowlist is empty, every address is allowed.
+// If the allowlist is empty, every address is allowed. Otherwise the remote
+// IP must match at least one rule — loopback has no implicit exception.
 func (m *Manager) IsIPAllowed(remoteAddr string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -86,11 +87,6 @@ func (m *Manager) IsIPAllowed(remoteAddr string) bool {
 	if ip == nil {
 		fmt.Printf("[auth] WARNING: cannot parse remote IP %q — denying\n", remoteAddr)
 		return false
-	}
-
-	// Always allow loopback regardless of allowlist
-	if ip.IsLoopback() {
-		return true
 	}
 
 	for _, r := range m.rules {
